@@ -141,8 +141,8 @@ void setup() {
 }
 
 void loop() {
-  // Fetch thresholds every 60 seconds (60000ms)
-  if (millis() - fetchThresholdPrevMillis > 60000 || fetchThresholdPrevMillis == 0) {
+  // Fetch thresholds every 2 seconds 
+  if (millis() - fetchThresholdPrevMillis > 2000 || fetchThresholdPrevMillis == 0) {
     fetchThresholdPrevMillis = millis();
     fetchThresholds();
   }

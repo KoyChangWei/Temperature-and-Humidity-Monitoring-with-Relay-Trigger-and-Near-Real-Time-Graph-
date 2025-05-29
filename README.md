@@ -189,7 +189,7 @@ dependencies:
 | `/get_threshold_for_arduino.php` | GET | Get current thresholds | None |
 | `/update_threshold.php` | POST | Update threshold values | `temp_threshold`, `humidity_threshold` |
 | `/login.php` | POST | User authentication | `username`, `password` |
-| `/register.php` | POST | User registration | `username`, `password`, `email` |
+| `/register.php` | POST | User registration | `password`, `email` |
 
 ### Example API Usage
 ```bash

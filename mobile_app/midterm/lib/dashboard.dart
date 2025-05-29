@@ -3,11 +3,13 @@ import 'package:fl_chart/fl_chart.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'dart:async';
+import 'dart:ui';
 import 'package:intl/intl.dart';
 import 'myconfig.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'login_page.dart';
 import 'threshold_config_page.dart';
+import 'package:flutter/rendering.dart';
 
 class SensorData {
   final int id;
@@ -59,6 +61,10 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
   bool _autoReload = true; // Always start with auto-reload ON
   int _dataLimit = 50; // Default limit
 
+  // Threshold alert variables
+  double _temperatureThreshold = 30.0; // Default threshold
+  bool _isHighTempAlert = false;
+
   late AnimationController _fadeController;
   late AnimationController _scaleController;
   late Animation<double> _fadeAnimation;
@@ -91,6 +97,7 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
       curve: Curves.elasticOut,
     );
 
+    _loadThreshold(); // Load threshold values
     _loadSensorData();
     _startRealTimeUpdates();
     
@@ -227,12 +234,22 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
 
   Future<void> _loadSensorData() async {
     try {
-      final response = await http.get(
-        Uri.parse("${MyConfig.server}/get_sensor_data.php?limit=$_dataLimit"),
-      ).timeout(const Duration(seconds: 10));
+      // Load both sensor data and threshold in parallel for real-time updates
+      final responses = await Future.wait([
+        http.get(
+          Uri.parse("${MyConfig.server}/get_sensor_data.php?limit=$_dataLimit"),
+        ).timeout(const Duration(seconds: 10)),
+        http.get(
+          Uri.parse("${MyConfig.server}/get_threshold.php"),
+        ).timeout(const Duration(seconds: 10)),
+      ]);
 
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
+      final sensorResponse = responses[0];
+      final thresholdResponse = responses[1];
+
+      // Process sensor data
+      if (sensorResponse.statusCode == 200) {
+        final data = jsonDecode(sensorResponse.body);
         if (data['status'] == 'success') {
           setState(() {
             sensorDataList = (data['data'] as List)
@@ -252,14 +269,74 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
         }
       } else {
         setState(() {
-          _errorMessage = 'Server error: ${response.statusCode}';
+          _errorMessage = 'Server error: ${sensorResponse.statusCode}';
           _isLoading = false;
         });
       }
+
+      // Process threshold data and detect changes
+      if (thresholdResponse.statusCode == 200) {
+        final thresholdData = jsonDecode(thresholdResponse.body);
+        if (thresholdData['status'] == 'success' && thresholdData['data'].isNotEmpty) {
+          double newThreshold = double.parse(thresholdData['data'][0]['threshold_temp'].toString());
+          if (newThreshold != _temperatureThreshold) {
+            setState(() {
+              _temperatureThreshold = newThreshold;
+            });
+            // Show notification when threshold changes
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Row(
+                  children: [
+                    const Icon(Icons.thermostat, color: Colors.white),
+                    const SizedBox(width: 8),
+                    Text('Threshold updated to ${_temperatureThreshold.toStringAsFixed(1)}°C'),
+                  ],
+                ),
+                backgroundColor: Colors.blue,
+                duration: const Duration(seconds: 3),
+              ),
+            );
+          }
+        }
+      }
+      
+      // Check for temperature alerts after loading both data and threshold
+      _checkTemperatureAlert();
+      
     } catch (e) {
       setState(() {
         _errorMessage = 'Network error: $e';
         _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _loadThreshold() async {
+    try {
+      final response = await http.get(
+        Uri.parse("${MyConfig.server}/get_threshold.php"),
+      ).timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        if (data['status'] == 'success' && data['data'].isNotEmpty) {
+          setState(() {
+            _temperatureThreshold = double.parse(data['data'][0]['threshold_temp'].toString());
+          });
+        }
+      }
+    } catch (e) {
+      // Use default threshold if loading fails
+      print('Failed to load threshold: $e');
+    }
+  }
+
+  void _checkTemperatureAlert() {
+    if (sensorDataList.isNotEmpty) {
+      double currentTemp = sensorDataList.last.temperature;
+      setState(() {
+        _isHighTempAlert = currentTemp > _temperatureThreshold;
       });
     }
   }
@@ -295,7 +372,10 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
           colors: [
             Theme.of(context).colorScheme.primary,
             Theme.of(context).colorScheme.primaryContainer,
+            Theme.of(context).colorScheme.secondary,
           ],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
         ),
         borderRadius: const BorderRadius.only(
           bottomLeft: Radius.circular(30),
@@ -303,383 +383,638 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
         ),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.1),
-            blurRadius: 10,
-            offset: const Offset(0, 5),
+            color: Theme.of(context).colorScheme.primary.withOpacity(0.4),
+            blurRadius: 25,
+            offset: const Offset(0, 12),
+          ),
+          BoxShadow(
+            color: Colors.black.withOpacity(0.15),
+            blurRadius: 15,
+            offset: const Offset(0, 6),
           ),
         ],
       ),
-      child: SafeArea(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // First row: Real-Time Monitor title and logout button
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      child: ClipRRect(
+        borderRadius: const BorderRadius.only(
+          bottomLeft: Radius.circular(30),
+          bottomRight: Radius.circular(30),
+        ),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 15, sigmaY: 15), // Increased blur for more glass effect
+          child: SafeArea(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+                // First row: Real-Time Monitor title and logout button
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text(
-                      'Real-Time Monitor',
-                      style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      widget.userEmail,
-                      style: const TextStyle(
-                        color: Colors.white70,
-                        fontSize: 16,
-                      ),
-                    ),
-                  ],
-                ),
-                // Logout button
-                GestureDetector(
-                  onTap: _logout,
-                  child: Container(
-                    padding: const EdgeInsets.all(10),
-                    decoration: BoxDecoration(
-                      color: Colors.red.withOpacity(0.7),
-                      borderRadius: BorderRadius.circular(15),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.red.withOpacity(0.3),
-                          blurRadius: 8,
-                          offset: const Offset(0, 2),
-                        ),
-                      ],
-                    ),
-                    child: const Icon(
-                      Icons.logout,
-                      color: Colors.white,
-                      size: 24,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            
-            const SizedBox(height: 16),
-            
-            // Second row: Control buttons
-            Row(
-              children: [
-                // Auto-reload toggle button - more prominent when ON
-                GestureDetector(
-                  onTap: _toggleAutoReload,
-                  child: Container(
-                    padding: const EdgeInsets.all(10),
-                    decoration: BoxDecoration(
-                      color: _autoReload 
-                          ? Colors.green.withOpacity(0.8) 
-                          : Colors.red.withOpacity(0.6),
-                      borderRadius: BorderRadius.circular(15),
-                      boxShadow: _autoReload ? [
-                        BoxShadow(
-                          color: Colors.green.withOpacity(0.3),
-                          blurRadius: 8,
-                          offset: const Offset(0, 2),
-                        ),
-                      ] : null,
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Icon(
-                          _autoReload ? Icons.autorenew : Icons.pause,
-                          color: Colors.white,
-                          size: 18,
+                        Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  colors: [
+                                    Theme.of(context).colorScheme.secondary,
+                                    Theme.of(context).colorScheme.tertiary,
+                                  ],
+                                ),
+                                borderRadius: BorderRadius.circular(12),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Theme.of(context).colorScheme.secondary.withOpacity(0.4),
+                                    blurRadius: 8,
+                                    offset: const Offset(0, 4),
+                                  ),
+                                ],
+                              ),
+                              child: const Icon(
+                                Icons.sensors,
+                                color: Colors.white,
+                                size: 20,
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Text(
+                              'Real-Time Monitor',
+                              style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                                shadows: [
+                                  Shadow(
+                                    color: Colors.black.withOpacity(0.3),
+                                    blurRadius: 4,
+                                    offset: const Offset(0, 2),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
                         ),
-                        const SizedBox(width: 4),
-                        Text(
-                          _autoReload ? 'LIVE' : 'OFF',
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 12,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                // Manual reload button
-                GestureDetector(
-                  onTap: _loadSensorData,
-                  child: Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withOpacity(0.2),
-                      borderRadius: BorderRadius.circular(15),
-                    ),
-                    child: const Icon(
-                      Icons.refresh,
-                      color: Colors.white,
-                      size: 20,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                // Data limit selector button
-                GestureDetector(
-                  onTap: _showDataLimitDialog,
-                  child: Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withOpacity(0.2),
-                      borderRadius: BorderRadius.circular(15),
-                    ),
-                    child: const Icon(
-                      Icons.tune,
-                      color: Colors.white,
-                      size: 20,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                // Threshold configuration button
-                GestureDetector(
-                  onTap: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) => const ThresholdConfigPage(),
-                      ),
-                    );
-                  },
-                  child: Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: Colors.orange.withOpacity(0.8),
-                      borderRadius: BorderRadius.circular(15),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.orange.withOpacity(0.3),
-                          blurRadius: 8,
-                          offset: const Offset(0, 2),
-                        ),
-                      ],
-                    ),
-                    child: const Icon(
-                      Icons.thermostat_outlined,
-                      color: Colors.white,
-                      size: 20,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Container(
-                  padding: const EdgeInsets.all(8),
-                  decoration: BoxDecoration(
-                    color: Colors.white.withOpacity(0.2),
-                    borderRadius: BorderRadius.circular(15),
-                  ),
-                  child: const Icon(
-                    Icons.sensors,
-                    color: Colors.white,
-                    size: 20,
-                  ),
-                ),
-              ],
-            ),
-            
-            const SizedBox(height: 16),
-            
-            // Third row: Info tags (scrollable)
-            SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withOpacity(0.2),
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(Icons.access_time, color: Colors.white70, size: 16),
-                        const SizedBox(width: 8),
-                        Text(
-                          'Login: ${_getMalaysiaFormattedTime(widget.loginTime)}',
-                          style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 14,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  if (_lastUpdated != null) ...[
-                    const SizedBox(width: 12),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                      decoration: BoxDecoration(
-                        color: _autoReload 
-                            ? Colors.green.withOpacity(0.3) 
-                            : Colors.white.withOpacity(0.2),
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            Icons.update, 
-                            color: _autoReload ? Colors.white : Colors.white70, 
-                            size: 16
-                          ),
-                          const SizedBox(width: 8),
-                          Text(
-                            'Updated: ${DateFormat('HH:mm:ss').format(_lastUpdated!)} Malaysia',
-                            style: TextStyle(
-                              color: _autoReload ? Colors.white : Colors.white70,
-                              fontSize: 14,
-                              fontWeight: _autoReload ? FontWeight.w500 : FontWeight.normal,
+                        const SizedBox(height: 8),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withOpacity(0.2),
+                            borderRadius: BorderRadius.circular(20),
+                            border: Border.all(
+                              color: Colors.white.withOpacity(0.3),
+                              width: 1,
                             ),
                           ),
-                        ],
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.person_outline,
+                                color: Colors.white.withOpacity(0.9),
+                                size: 16,
+                              ),
+                              const SizedBox(width: 6),
+                              Text(
+                                widget.userEmail,
+                                style: TextStyle(
+                                  color: Colors.white.withOpacity(0.95),
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    // Logout button
+                    GestureDetector(
+                      onTap: _logout,
+                      child: Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            colors: [
+                              Colors.red.withOpacity(0.9),
+                              Colors.red.withOpacity(0.7),
+                            ],
+                          ),
+                          borderRadius: BorderRadius.circular(16),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.red.withOpacity(0.4),
+                              blurRadius: 8,
+                              offset: const Offset(0, 4),
+                            ),
+                          ],
+                        ),
+                        child: const Icon(
+                          Icons.logout,
+                          color: Colors.white,
+                          size: 22,
+                        ),
                       ),
                     ),
                   ],
-                  const SizedBox(width: 12),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withOpacity(0.2),
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          _autoReload ? Icons.autorenew : Icons.pause_circle_outline,
-                          color: Colors.white70,
-                          size: 16,
-                        ),
-                        const SizedBox(width: 8),
-                        Text(
-                          'Auto: ${_autoReload ? "2s" : "OFF"}',
-                          style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 14,
+                ),
+                
+                const SizedBox(height: 20),
+                
+                // Second row: Control buttons
+                SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children: [
+                      // Auto-reload toggle button
+                      GestureDetector(
+                        onTap: _toggleAutoReload,
+                        child: AnimatedContainer(
+                          duration: const Duration(milliseconds: 300),
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              colors: _autoReload 
+                                  ? [const Color(0xFF4CAF50), const Color(0xFF66BB6A)]
+                                  : [const Color(0xFFE57373), const Color(0xFFEF5350)],
+                            ),
+                            borderRadius: BorderRadius.circular(20),
+                            boxShadow: _autoReload ? [
+                              BoxShadow(
+                                color: Colors.green.withOpacity(0.4),
+                                blurRadius: 12,
+                                offset: const Offset(0, 4),
+                              ),
+                            ] : [
+                              BoxShadow(
+                                color: Colors.red.withOpacity(0.3),
+                                blurRadius: 8,
+                                offset: const Offset(0, 4),
+                              ),
+                            ],
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                _autoReload ? Icons.autorenew : Icons.pause,
+                                color: Colors.white,
+                                size: 18,
+                              ),
+                              const SizedBox(width: 6),
+                              Text(
+                                _autoReload ? 'LIVE' : 'PAUSED',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.bold,
+                                  letterSpacing: 0.5,
+                                ),
+                              ),
+                            ],
                           ),
                         ),
-                      ],
-                    ),
+                      ),
+                      const SizedBox(width: 10),
+                      // Manual reload button
+                      _buildControlButton(
+                        onTap: _loadSensorData,
+                        icon: Icons.refresh,
+                        tooltip: 'Refresh',
+                        color: const Color(0xFF42A5F5),
+                      ),
+                      const SizedBox(width: 10),
+                      // Data limit selector button
+                      _buildControlButton(
+                        onTap: _showDataLimitDialog,
+                        icon: Icons.tune,
+                        tooltip: 'Data Limit',
+                        color: const Color(0xFF7E57C2),
+                      ),
+                      const SizedBox(width: 10),
+                      // Threshold configuration button
+                      _buildControlButton(
+                        onTap: () async {
+                          await Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (context) => const ThresholdConfigPage(),
+                            ),
+                          );
+                          // Reload data when returning from threshold config
+                          _loadSensorData();
+                        },
+                        icon: Icons.thermostat_outlined,
+                        tooltip: 'Thresholds',
+                        color: const Color(0xFFFF7043),
+                      ),
+                    ],
                   ),
-                  const SizedBox(width: 12),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withOpacity(0.2),
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(Icons.storage, color: Colors.white70, size: 16),
-                        const SizedBox(width: 8),
-                        Text(
-                          'Records: $_totalRecords',
-                          style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 14,
+                ),
+                
+                const SizedBox(height: 16),
+                
+                // Third row: Info tags
+                SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children: [
+                      // Temperature Alert
+                      _buildTemperatureAlert(),
+                      const SizedBox(width: 12),
+                      _buildInfoTag(
+                        icon: Icons.access_time,
+                        text: 'Login: ${_getMalaysiaFormattedTime(widget.loginTime)}',
+                        color: const Color(0xFF5C6BC0),
+                      ),
+                      if (_lastUpdated != null) ...[
+                        const SizedBox(width: 12),
+                        AnimatedContainer(
+                          duration: const Duration(milliseconds: 300),
+                          child: _buildInfoTag(
+                            icon: Icons.update,
+                            text: 'Updated: ${DateFormat('HH:mm:ss').format(_lastUpdated!)}',
+                            color: _autoReload ? const Color(0xFF4CAF50) : const Color(0xFF78909C),
+                            isLive: _autoReload,
                           ),
                         ),
                       ],
-                    ),
+                      const SizedBox(width: 12),
+                      _buildInfoTag(
+                        icon: Icons.storage,
+                        text: 'Records: $_totalRecords',
+                        color: const Color(0xFF5C6BC0),
+                      ),
+                    ],
                   ),
-                  const SizedBox(width: 12),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withOpacity(0.2),
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(Icons.show_chart, color: Colors.white70, size: 16),
-                        const SizedBox(width: 8),
-                        Text(
-                          'Showing: $_dataLimit',
-                          style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 14,
-                          ),
-                        ),
-                      ],
-                    ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+  
+  Widget _buildControlButton({
+    required VoidCallback onTap,
+    required IconData icon,
+    required String tooltip,
+    required Color color,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            colors: [
+              color.withOpacity(0.8),
+              color.withOpacity(0.6),
+            ],
+          ),
+          borderRadius: BorderRadius.circular(16),
+          boxShadow: [
+            BoxShadow(
+              color: color.withOpacity(0.3),
+              blurRadius: 8,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Icon(
+          icon,
+          color: Colors.white,
+          size: 20,
+        ),
+      ),
+    );
+  }
+  
+  Widget _buildInfoTag({
+    required IconData icon,
+    required String text,
+    required Color color,
+    bool isLive = false,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [
+            color.withOpacity(0.2),
+            color.withOpacity(0.1),
+          ],
+        ),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: color.withOpacity(0.3),
+          width: 1,
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (isLive)
+            Container(
+              width: 6,
+              height: 6,
+              margin: const EdgeInsets.only(right: 8),
+              decoration: BoxDecoration(
+                color: Colors.green,
+                borderRadius: BorderRadius.circular(3),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.green.withOpacity(0.8),
+                    blurRadius: 4,
                   ),
                 ],
               ),
             ),
+          Icon(icon, color: Colors.white.withOpacity(0.8), size: 16),
+          const SizedBox(width: 8),
+          Text(
+            text,
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.9),
+              fontSize: 13,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildModernStatsCard(String title, String value, String unit, IconData icon, List<Color> colors) {
+    return Container(
+      height: 180,
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            Colors.white.withOpacity(0.15),
+            Colors.white.withOpacity(0.05),
           ],
+        ),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(
+          color: Colors.white.withOpacity(0.2),
+          width: 1.5,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: colors[0].withOpacity(0.3),
+            blurRadius: 20,
+            offset: const Offset(0, 10),
+          ),
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(24),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+          child: Container(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(colors: colors),
+                        borderRadius: BorderRadius.circular(16),
+                        boxShadow: [
+                          BoxShadow(
+                            color: colors[0].withOpacity(0.4),
+                            blurRadius: 8,
+                            offset: const Offset(0, 4),
+                          ),
+                        ],
+                      ),
+                      child: Icon(icon, color: Colors.white, size: 24),
+                    ),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.2),
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: Text(
+                        unit,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 14,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: Colors.white.withOpacity(0.7),
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.baseline,
+                      textBaseline: TextBaseline.alphabetic,
+                      children: [
+                        Text(
+                          value,
+                          style: const TextStyle(
+                            fontSize: 36,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white,
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          unit,
+                          style: TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.w500,
+                            color: Colors.white.withOpacity(0.8),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );
   }
 
-  Widget _buildStatsCard(String title, String value, String unit, IconData icon, Color color) {
+  Widget _buildQuickStatsOverview() {
+    if (sensorDataList.isEmpty) return const SizedBox.shrink();
+    
+    // Calculate averages
+    double avgTemp = 0;
+    double avgHumidity = 0;
+    double minTemp = double.infinity;
+    double maxTemp = double.negativeInfinity;
+    double minHumidity = double.infinity;
+    double maxHumidity = double.negativeInfinity;
+    
+    for (var data in sensorDataList) {
+      avgTemp += data.temperature;
+      avgHumidity += data.humidity;
+      if (data.temperature < minTemp) minTemp = data.temperature;
+      if (data.temperature > maxTemp) maxTemp = data.temperature;
+      if (data.humidity < minHumidity) minHumidity = data.humidity;
+      if (data.humidity > maxHumidity) maxHumidity = data.humidity;
+    }
+    
+    avgTemp /= sensorDataList.length;
+    avgHumidity /= sensorDataList.length;
+    
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        color: Colors.white,
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            Colors.white.withOpacity(0.1),
+            Colors.white.withOpacity(0.05),
+          ],
+        ),
         borderRadius: BorderRadius.circular(20),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.1),
-            blurRadius: 10,
-            offset: const Offset(0, 5),
-          ),
-        ],
+        border: Border.all(
+          color: Colors.white.withOpacity(0.2),
+          width: 1,
+        ),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(20),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+          child: Column(
             children: [
-              Icon(icon, color: color, size: 30),
-              Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: color.withOpacity(0.1),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: Text(
-                  unit,
-                  style: TextStyle(
-                    color: color,
-                    fontWeight: FontWeight.bold,
-                    fontSize: 12,
+              Row(
+                children: [
+                  Icon(
+                    Icons.analytics_outlined,
+                    color: Colors.white.withOpacity(0.9),
+                    size: 24,
                   ),
-                ),
+                  const SizedBox(width: 12),
+                  Text(
+                    'Quick Analytics',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white.withOpacity(0.9),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 20),
+              Row(
+                children: [
+                  Expanded(
+                    child: _buildQuickStatItem(
+                      'Avg Temp',
+                      '${avgTemp.toStringAsFixed(1)}°C',
+                      Icons.thermostat,
+                      const Color(0xFFFF6B6B),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: _buildQuickStatItem(
+                      'Avg Humidity',
+                      '${avgHumidity.toStringAsFixed(1)}%',
+                      Icons.water_drop,
+                      const Color(0xFF4ECDC4),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: _buildQuickStatItem(
+                      'Temp Range',
+                      '${minTemp.toStringAsFixed(1)} - ${maxTemp.toStringAsFixed(1)}°C',
+                      Icons.swap_vert,
+                      const Color(0xFFFFB347),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: _buildQuickStatItem(
+                      'Humidity Range',
+                      '${minHumidity.toStringAsFixed(1)} - ${maxHumidity.toStringAsFixed(1)}%',
+                      Icons.swap_vert,
+                      const Color(0xFF6A5ACD),
+                    ),
+                  ),
+                ],
               ),
             ],
           ),
-          const SizedBox(height: 16),
-          Text(
-            title,
-            style: const TextStyle(
-              fontSize: 14,
-              color: Colors.grey,
-              fontWeight: FontWeight.w500,
-            ),
+        ),
+      ),
+    );
+  }
+  
+  Widget _buildQuickStatItem(String label, String value, IconData icon, Color color) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: color.withOpacity(0.3),
+          width: 1,
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            icon,
+            color: color,
+            size: 20,
           ),
-          const SizedBox(height: 4),
-          Text(
-            value,
-            style: TextStyle(
-              fontSize: 28, // Larger for better visibility
-              fontWeight: FontWeight.bold,
-              color: color,
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: Colors.white.withOpacity(0.7),
+                  ),
+                ),
+                Text(
+                  value,
+                  style: const TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+              ],
             ),
           ),
         ],
@@ -687,42 +1022,82 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
     );
   }
 
-  Widget _buildChart(String title, List<FlSpot> spots, Color color) {
+  Widget _buildModernChart(String title, List<FlSpot> spots, List<Color> colors, IconData icon) {
     if (spots.isEmpty) {
       return Container(
-        height: 280,
-        padding: const EdgeInsets.all(20),
-        margin: const EdgeInsets.symmetric(vertical: 10),
+        height: 320,
+        padding: const EdgeInsets.all(24),
+        margin: const EdgeInsets.symmetric(vertical: 12),
         decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(20),
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              Colors.white.withOpacity(0.1),
+              Colors.white.withOpacity(0.05),
+            ],
+          ),
+          borderRadius: BorderRadius.circular(24),
+          border: Border.all(
+            color: Colors.white.withOpacity(0.2),
+            width: 1,
+          ),
           boxShadow: [
             BoxShadow(
-              color: Colors.black.withOpacity(0.1),
-              blurRadius: 10,
-              offset: const Offset(0, 5),
+              color: colors[0].withOpacity(0.2),
+              blurRadius: 20,
+              offset: const Offset(0, 8),
             ),
           ],
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              title,
-              style: const TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
-                color: Colors.black87,
-              ),
+            Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(colors: colors),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Icon(
+                    icon,
+                    color: Colors.white,
+                    size: 20,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+              ],
             ),
             const Expanded(
               child: Center(
-                child: Text(
-                  'No data available',
-                  style: TextStyle(
-                    fontSize: 16,
-                    color: Colors.grey,
-                  ),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      Icons.show_chart,
+                      size: 48,
+                      color: Colors.white54,
+                    ),
+                    SizedBox(height: 12),
+                    Text(
+                      'No data available',
+                      style: TextStyle(
+                        fontSize: 16,
+                        color: Colors.white54,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ),
@@ -731,187 +1106,595 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
       );
     }
 
-    // Calculate dynamic Y-axis range for better graph clarity
+    // Calculate dynamic Y-axis range with better padding
     final values = spots.map((spot) => spot.y).toList();
     final minValue = values.reduce((a, b) => a < b ? a : b);
     final maxValue = values.reduce((a, b) => a > b ? a : b);
     final range = maxValue - minValue;
-    final padding = range * 0.1; // 10% padding
+    final padding = range * 0.15;
     final adjustedMin = (minValue - padding).clamp(0.0, double.infinity);
     final adjustedMax = maxValue + padding;
 
+    // Calculate intervals for better label distribution
+    final yInterval = range > 0 ? (range / 4).ceilToDouble() : 1.0;
+    final xInterval = spots.length > 10 ? (spots.length / 6).ceilToDouble() : 5.0;
+
     return Container(
-      height: 280,
-      padding: const EdgeInsets.all(20),
-      margin: const EdgeInsets.symmetric(vertical: 10),
+      height: 320,
+      padding: const EdgeInsets.all(24),
+      margin: const EdgeInsets.symmetric(vertical: 12),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(20),
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            Colors.white.withOpacity(0.1),
+            Colors.white.withOpacity(0.05),
+          ],
+        ),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(
+          color: Colors.white.withOpacity(0.2),
+          width: 1,
+        ),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.1),
-            blurRadius: 10,
-            offset: const Offset(0, 5),
+            color: colors[0].withOpacity(0.2),
+            blurRadius: 20,
+            offset: const Offset(0, 8),
           ),
         ],
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(24),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 5, sigmaY: 5),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(
-                title,
-                style: const TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.black87,
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(colors: colors),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Icon(
+                          icon,
+                          color: Colors.white,
+                          size: 20,
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            title,
+                            style: const TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white,
+                            ),
+                          ),
+                          Text(
+                            '${spots.length} data points',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.white.withOpacity(0.6),
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                  // Live indicator and current value
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      if (_autoReload)
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                          decoration: BoxDecoration(
+                            color: Colors.green,
+                            borderRadius: BorderRadius.circular(16),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.green.withOpacity(0.3),
+                                blurRadius: 8,
+                                offset: const Offset(0, 2),
+                              ),
+                            ],
+                          ),
+                          child: const Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.circle, color: Colors.white, size: 8),
+                              SizedBox(width: 6),
+                              Text(
+                                'LIVE',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.bold,
+                                  letterSpacing: 0.5,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      const SizedBox(height: 4),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(colors: colors),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Text(
+                          '${spots.last.y.toStringAsFixed(1)}${title.contains('Temperature') ? '°C' : '%'}',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 14,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+              const SizedBox(height: 24),
+              Expanded(
+                child: LineChart(
+                  LineChartData(
+                    gridData: FlGridData(
+                      show: true,
+                      drawVerticalLine: true,
+                      horizontalInterval: yInterval,
+                      verticalInterval: xInterval,
+                      getDrawingHorizontalLine: (value) {
+                        return FlLine(
+                          color: Colors.white.withOpacity(0.1),
+                          strokeWidth: 1,
+                          dashArray: [5, 5],
+                        );
+                      },
+                      getDrawingVerticalLine: (value) {
+                        return FlLine(
+                          color: Colors.white.withOpacity(0.05),
+                          strokeWidth: 1,
+                          dashArray: [3, 3],
+                        );
+                      },
+                    ),
+                    titlesData: FlTitlesData(
+                      show: true,
+                      rightTitles: const AxisTitles(
+                        sideTitles: SideTitles(showTitles: false),
+                      ),
+                      topTitles: const AxisTitles(
+                        sideTitles: SideTitles(showTitles: false),
+                      ),
+                      bottomTitles: AxisTitles(
+                        sideTitles: SideTitles(
+                          showTitles: true,
+                          reservedSize: 40,
+                          interval: xInterval,
+                          getTitlesWidget: (value, meta) {
+                            final index = value.toInt();
+                            if (index >= 0 && index < sensorDataList.length) {
+                              final timestamp = sensorDataList[index].timestamp;
+                              // Show different formats based on data density
+                              if (spots.length > 50) {
+                                // For dense data, show only hour
+                                return Padding(
+                                  padding: const EdgeInsets.only(top: 8.0),
+                                  child: Text(
+                                    DateFormat('HH:mm').format(timestamp),
+                                    style: TextStyle(
+                                      color: Colors.white.withOpacity(0.6),
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                  ),
+                                );
+                              } else {
+                                // For sparse data, show time with more detail
+                                return Padding(
+                                  padding: const EdgeInsets.only(top: 8.0),
+                                  child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Text(
+                                        DateFormat('HH:mm').format(timestamp),
+                                        style: TextStyle(
+                                          color: Colors.white.withOpacity(0.7),
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                      Text(
+                                        DateFormat('dd/MM').format(timestamp),
+                                        style: TextStyle(
+                                          color: Colors.white.withOpacity(0.5),
+                                          fontSize: 9,
+                                          fontWeight: FontWeight.w400,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              }
+                            }
+                            return const SizedBox.shrink();
+                          },
+                        ),
+                      ),
+                      leftTitles: AxisTitles(
+                        sideTitles: SideTitles(
+                          showTitles: true,
+                          interval: yInterval,
+                          getTitlesWidget: (value, meta) {
+                            return Container(
+                              padding: const EdgeInsets.only(right: 8),
+                              child: Text(
+                                value.toStringAsFixed(1),
+                                style: TextStyle(
+                                  color: Colors.white.withOpacity(0.7),
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                                textAlign: TextAlign.right,
+                              ),
+                            );
+                          },
+                          reservedSize: 50,
+                        ),
+                      ),
+                    ),
+                    borderData: FlBorderData(
+                      show: true,
+                      border: Border(
+                        left: BorderSide(color: Colors.white.withOpacity(0.3), width: 2),
+                        bottom: BorderSide(color: Colors.white.withOpacity(0.3), width: 2),
+                        top: BorderSide.none,
+                        right: BorderSide.none,
+                      ),
+                    ),
+                    minX: 0,
+                    maxX: (spots.length - 1).toDouble(),
+                    minY: adjustedMin,
+                    maxY: adjustedMax,
+                    lineBarsData: [
+                      LineChartBarData(
+                        spots: spots,
+                        isCurved: true,
+                        curveSmoothness: 0.35,
+                        gradient: LinearGradient(
+                          colors: colors,
+                          stops: const [0.0, 1.0],
+                        ),
+                        barWidth: 3,
+                        isStrokeCapRound: true,
+                        dotData: FlDotData(
+                          show: spots.length <= 20, // Only show dots for smaller datasets
+                          getDotPainter: (spot, percent, barData, index) {
+                            return FlDotCirclePainter(
+                              radius: 4,
+                              color: Colors.white,
+                              strokeWidth: 3,
+                              strokeColor: colors[0],
+                            );
+                          },
+                        ),
+                        belowBarData: BarAreaData(
+                          show: true,
+                          gradient: LinearGradient(
+                            colors: [
+                              colors[0].withOpacity(0.3),
+                              colors[0].withOpacity(0.1),
+                              colors[0].withOpacity(0.0),
+                            ],
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            stops: const [0.0, 0.5, 1.0],
+                          ),
+                        ),
+                      ),
+                    ],
+                    lineTouchData: LineTouchData(
+                      enabled: true,
+                      touchTooltipData: LineTouchTooltipData(
+                        getTooltipItems: (List<LineBarSpot> touchedBarSpots) {
+                          return touchedBarSpots.map((barSpot) {
+                            final index = barSpot.x.toInt();
+                            if (index >= 0 && index < sensorDataList.length) {
+                              final data = sensorDataList[index];
+                              return LineTooltipItem(
+                                '${barSpot.y.toStringAsFixed(1)}${title.contains('Temperature') ? '°C' : '%'}\n${DateFormat('MMM dd, HH:mm').format(data.timestamp)}',
+                                const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 12,
+                                ),
+                              );
+                            }
+                            return null;
+                          }).toList();
+                        },
+                      ),
+                      handleBuiltInTouches: true,
+                    ),
+                  ),
                 ),
               ),
-              // Live indicator for auto-refresh
-              if (_autoReload)
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: Colors.green,
-                    borderRadius: BorderRadius.circular(12),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildModernDataInfoCard() {
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            Colors.white.withOpacity(0.1),
+            Colors.white.withOpacity(0.05),
+          ],
+        ),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: Colors.white.withOpacity(0.2),
+          width: 1,
+        ),
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(20),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      gradient: const LinearGradient(
+                        colors: [Color(0xFF7E57C2), Color(0xFF9575CD)],
+                      ),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: const Icon(
+                      Icons.dataset,
+                      color: Colors.white,
+                      size: 20,
+                    ),
                   ),
-                  child: const Row(
-                    mainAxisSize: MainAxisSize.min,
+                  const SizedBox(width: 12),
+                  Text(
+                    'Data Overview',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white.withOpacity(0.9),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 20),
+              
+              // Data stats in grid
+              Row(
+                children: [
+                  Expanded(
+                    child: _buildDataStatItem(
+                      'Total Records',
+                      _totalRecords.toString(),
+                      Icons.storage,
+                      const Color(0xFF42A5F5),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: _buildDataStatItem(
+                      'Showing',
+                      sensorDataList.length.toString(),
+                      Icons.visibility,
+                      const Color(0xFF66BB6A),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: GestureDetector(
+                      onTap: _showDataLimitDialog,
+                      child: _buildDataStatItem(
+                        'Limit',
+                        '$_dataLimit',
+                        Icons.show_chart,
+                        const Color(0xFFFF7043),
+                        isClickable: true,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _buildDataStatItem(
+                      'Update',
+                      _autoReload ? '2s' : 'Manual',
+                      _autoReload ? Icons.autorenew : Icons.pause,
+                      _autoReload ? const Color(0xFF26A69A) : const Color(0xFFEF5350),
+                    ),
+                  ),
+                ],
+              ),
+              if (_lastUpdated != null) ...[
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.05),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: Colors.white.withOpacity(0.1),
+                      width: 1,
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      Icon(Icons.circle, color: Colors.white, size: 8),
-                      SizedBox(width: 4),
+                      Icon(
+                        Icons.access_time,
+                        color: Colors.white.withOpacity(0.7),
+                        size: 16,
+                      ),
+                      const SizedBox(width: 8),
                       Text(
-                        'LIVE',
+                        'Last Updated: ${DateFormat('HH:mm:ss').format(_lastUpdated!)}',
                         style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 10,
-                          fontWeight: FontWeight.bold,
+                          color: Colors.white.withOpacity(0.7),
+                          fontSize: 14,
+                          fontWeight: FontWeight.w500,
                         ),
                       ),
                     ],
                   ),
                 ),
+              ],
             ],
           ),
-          const SizedBox(height: 20),
+        ),
+      ),
+    );
+  }
+  
+  Widget _buildDataStatItem(String label, String value, IconData icon, Color color, {bool isClickable = false}) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: color.withOpacity(0.3),
+          width: 1,
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            icon,
+            color: color,
+            size: 20,
+          ),
+          const SizedBox(width: 8),
           Expanded(
-            child: LineChart(
-              LineChartData(
-                gridData: FlGridData(
-                  show: true,
-                  drawVerticalLine: true,
-                  horizontalInterval: range > 10 ? (range / 5).roundToDouble() : 1,
-                  verticalInterval: spots.length > 10 ? (spots.length / 10).roundToDouble() : 1,
-                  getDrawingHorizontalLine: (value) {
-                    return FlLine(
-                      color: Colors.grey.withOpacity(0.3),
-                      strokeWidth: 1,
-                    );
-                  },
-                  getDrawingVerticalLine: (value) {
-                    return FlLine(
-                      color: Colors.grey.withOpacity(0.3),
-                      strokeWidth: 1,
-                    );
-                  },
-                ),
-                titlesData: FlTitlesData(
-                  show: true,
-                  rightTitles: const AxisTitles(
-                    sideTitles: SideTitles(showTitles: false),
-                  ),
-                  topTitles: const AxisTitles(
-                    sideTitles: SideTitles(showTitles: false),
-                  ),
-                  bottomTitles: AxisTitles(
-                    sideTitles: SideTitles(
-                      showTitles: true,
-                      reservedSize: 30,
-                      interval: spots.length > 20 ? (spots.length / 5).roundToDouble() : 5,
-                      getTitlesWidget: (value, meta) {
-                        if (value.toInt() < sensorDataList.length) {
-                          return Padding(
-                            padding: const EdgeInsets.only(top: 8.0),
-                            child: Text(
-                              DateFormat('HH:mm').format(sensorDataList[value.toInt()].timestamp),
-                              style: const TextStyle(
-                                color: Colors.grey,
-                                fontSize: 10,
-                              ),
-                            ),
-                          );
-                        }
-                        return const Text('');
-                      },
-                    ),
-                  ),
-                  leftTitles: AxisTitles(
-                    sideTitles: SideTitles(
-                      showTitles: true,
-                      interval: range > 10 ? (range / 4).roundToDouble() : 2,
-                      getTitlesWidget: (value, meta) {
-                        return Text(
-                          value.toStringAsFixed(1),
-                          style: const TextStyle(
-                            color: Colors.grey,
-                            fontSize: 12,
-                            fontWeight: FontWeight.w500,
-                          ),
-                        );
-                      },
-                      reservedSize: 50,
-                    ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: Colors.white.withOpacity(0.7),
                   ),
                 ),
-                borderData: FlBorderData(
-                  show: true,
-                  border: Border.all(color: Colors.grey.withOpacity(0.3), width: 1),
+                Text(
+                  value,
+                  style: const TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
                 ),
-                minX: 0,
-                maxX: spots.length.toDouble() - 1,
-                minY: adjustedMin,
-                maxY: adjustedMax,
-                lineBarsData: [
-                  LineChartBarData(
-                    spots: spots,
-                    isCurved: true,
-                    gradient: LinearGradient(
-                      colors: [
-                        color.withOpacity(0.8),
-                        color,
-                      ],
-                    ),
-                    barWidth: 4, // Thicker line for better visibility
-                    isStrokeCapRound: true,
-                    dotData: FlDotData(
-                      show: true,
-                      getDotPainter: (spot, percent, barData, index) {
-                        return FlDotCirclePainter(
-                          radius: 5, // Larger dots
-                          color: color,
-                          strokeWidth: 2,
-                          strokeColor: Colors.white,
-                        );
-                      },
-                    ),
-                    belowBarData: BarAreaData(
-                      show: true,
-                      gradient: LinearGradient(
-                        colors: [
-                          color.withOpacity(0.4),
-                          color.withOpacity(0.1),
-                        ],
-                        begin: Alignment.topCenter,
-                        end: Alignment.bottomCenter,
+                if (isClickable)
+                  Row(
+                    children: [
+                      Icon(
+                        Icons.edit,
+                        size: 12,
+                        color: Colors.white.withOpacity(0.7),
                       ),
-                    ),
+                      const SizedBox(width: 2),
+                      Text(
+                        'Tap to edit',
+                        style: TextStyle(
+                          fontSize: 9,
+                          color: Colors.white.withOpacity(0.6),
+                        ),
+                      ),
+                    ],
                   ),
-                ],
-              ),
+              ],
             ),
           ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTemperatureAlert() {
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 500),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: _isHighTempAlert
+              ? [const Color(0xFFE53E3E), const Color(0xFFFC8181)]
+              : [const Color(0xFF38A169), const Color(0xFF68D391)],
+        ),
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [
+          BoxShadow(
+            color: (_isHighTempAlert ? Colors.red : Colors.green).withOpacity(0.4),
+            blurRadius: 12,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 300),
+            child: Icon(
+              _isHighTempAlert ? Icons.warning : Icons.check_circle,
+              key: ValueKey(_isHighTempAlert),
+              color: Colors.white,
+              size: 20,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            _isHighTempAlert ? 'Alert: High Temp!' : 'Normal',
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 14,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          if (_isHighTempAlert) ...[
+            const SizedBox(width: 8),
+            Text(
+              '>${_temperatureThreshold.toStringAsFixed(1)}°C',
+              style: TextStyle(
+                color: Colors.white.withOpacity(0.9),
+                fontSize: 12,
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -923,273 +1706,188 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
     double? latestHumidity = sensorDataList.isNotEmpty ? sensorDataList.last.humidity : null;
 
     return Scaffold(
-      backgroundColor: Colors.grey[50],
-      body: FadeTransition(
-        opacity: _fadeAnimation,
-        child: Column(
-          children: [
-            _buildTopBar(),
-            Expanded(
-              child: _isLoading
-                  ? const Center(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          CircularProgressIndicator(),
-                          SizedBox(height: 16),
-                          Text('Loading sensor data...'),
-                        ],
-                      ),
-                    )
-                  : _errorMessage != null
-                      ? Center(
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              const Icon(
-                                Icons.error_outline,
-                                size: 64,
-                                color: Colors.red,
-                              ),
-                              const SizedBox(height: 16),
-                              Text(
-                                'Error: $_errorMessage',
-                                style: const TextStyle(color: Colors.red),
-                                textAlign: TextAlign.center,
-                              ),
-                              const SizedBox(height: 16),
-                              ElevatedButton(
-                                onPressed: _loadSensorData,
-                                child: const Text('Retry'),
-                              ),
-                            ],
-                          ),
-                        )
-                      : SingleChildScrollView(
-                          padding: const EdgeInsets.all(20),
-                          child: ScaleTransition(
-                            scale: _scaleAnimation,
-                            child: Column(
-                              children: [
-                                // Stats Cards
-                                Row(
-                                  children: [
-                                    Expanded(
-                                      child: _buildStatsCard(
-                                        'Temperature',
-                                        latestTemperature?.toStringAsFixed(1) ?? '--',
-                                        '°C',
-                                        Icons.thermostat,
-                                        Colors.orange,
-                                      ),
-                                    ),
-                                    const SizedBox(width: 16),
-                                    Expanded(
-                                      child: _buildStatsCard(
-                                        'Humidity',
-                                        latestHumidity?.toStringAsFixed(1) ?? '--',
-                                        '%',
-                                        Icons.water_drop,
-                                        Colors.blue,
-                                      ),
-                                    ),
+      body: Container(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              const Color(0xFF212121), // Very dark grey
+              const Color(0xFF424242), // Dark grey
+              const Color(0xFF616161), // Medium dark grey
+            ],
+            stops: const [0.0, 0.5, 1.0],
+          ),
+        ),
+        child: FadeTransition(
+          opacity: _fadeAnimation,
+          child: Column(
+            children: [
+              _buildTopBar(),
+              Expanded(
+                child: _isLoading
+                    ? Center(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(24),
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  colors: [
+                                    Colors.white.withOpacity(0.1),
+                                    Colors.white.withOpacity(0.05),
                                   ],
                                 ),
-                                
-                                const SizedBox(height: 20),
-                                
-                                // Temperature Chart
-                                _buildChart(
-                                  'Temperature Trend',
-                                  _getTemperatureSpots(),
-                                  Colors.orange,
+                                borderRadius: BorderRadius.circular(20),
+                                border: Border.all(
+                                  color: Colors.white.withOpacity(0.2),
+                                  width: 1,
                                 ),
-                                
-                                // Humidity Chart
-                                _buildChart(
-                                  'Humidity Trend',
-                                  _getHumiditySpots(),
-                                  Colors.blue,
+                              ),
+                              child: const CircularProgressIndicator(
+                                valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                strokeWidth: 3,
+                              ),
+                            ),
+                            const SizedBox(height: 24),
+                            Text(
+                              'Loading sensor data...',
+                              style: TextStyle(
+                                color: Colors.white.withOpacity(0.9),
+                                fontSize: 16,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          ],
+                        ),
+                      )
+                    : _errorMessage != null
+                        ? Center(
+                            child: Container(
+                              margin: const EdgeInsets.all(32),
+                              padding: const EdgeInsets.all(32),
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  colors: [
+                                    Colors.red.withOpacity(0.2),
+                                    Colors.red.withOpacity(0.1),
+                                  ],
                                 ),
-                                
-                                const SizedBox(height: 20),
-                                
-                                // Data count info
-                                Container(
-                                  padding: const EdgeInsets.all(16),
-                                  decoration: BoxDecoration(
-                                    color: Colors.white,
-                                    borderRadius: BorderRadius.circular(15),
-                                    boxShadow: [
-                                      BoxShadow(
-                                        color: Colors.black.withOpacity(0.1),
-                                        blurRadius: 10,
-                                        offset: const Offset(0, 5),
-                                      ),
-                                    ],
+                                borderRadius: BorderRadius.circular(24),
+                                border: Border.all(
+                                  color: Colors.red.withOpacity(0.3),
+                                  width: 1,
+                                ),
+                              ),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    Icons.error_outline,
+                                    size: 64,
+                                    color: Colors.red[300],
                                   ),
-                                  child: Column(
+                                  const SizedBox(height: 16),
+                                  Text(
+                                    'Error: $_errorMessage',
+                                    style: TextStyle(
+                                      color: Colors.white.withOpacity(0.9),
+                                      fontSize: 16,
+                                    ),
+                                    textAlign: TextAlign.center,
+                                  ),
+                                  const SizedBox(height: 24),
+                                  ElevatedButton(
+                                    onPressed: _loadSensorData,
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.white.withOpacity(0.2),
+                                      foregroundColor: Colors.white,
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 32,
+                                        vertical: 16,
+                                      ),
+                                      shape: RoundedRectangleBorder(
+                                        borderRadius: BorderRadius.circular(16),
+                                      ),
+                                    ),
+                                    child: const Text(
+                                      'Retry',
+                                      style: TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          )
+                        : SingleChildScrollView(
+                            padding: const EdgeInsets.all(20),
+                            physics: const BouncingScrollPhysics(),
+                            child: ScaleTransition(
+                              scale: _scaleAnimation,
+                              child: Column(
+                                children: [
+                                  // Modern Stats Cards with Glassmorphism
+                                  Row(
                                     children: [
-                                      Row(
-                                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                        children: [
-                                          const Text(
-                                            'Total Records:',
-                                            style: TextStyle(
-                                              fontSize: 16,
-                                              color: Colors.grey,
-                                            ),
-                                          ),
-                                          Text(
-                                            '$_totalRecords',
-                                            style: TextStyle(
-                                              fontSize: 16,
-                                              fontWeight: FontWeight.bold,
-                                              color: Theme.of(context).colorScheme.primary,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                      const SizedBox(height: 8),
-                                      Row(
-                                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                        children: [
-                                          const Text(
-                                            'Showing:',
-                                            style: TextStyle(
-                                              fontSize: 14,
-                                              color: Colors.grey,
-                                            ),
-                                          ),
-                                          Text(
-                                            '${sensorDataList.length} records',
-                                            style: const TextStyle(
-                                              fontSize: 14,
-                                              color: Colors.grey,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                      if (_lastUpdated != null) ...[
-                                        const SizedBox(height: 8),
-                                        Row(
-                                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                          children: [
-                                            Text(
-                                              'Auto-reload: ${_autoReload ? "ON" : "OFF"}',
-                                              style: TextStyle(
-                                                fontSize: 14,
-                                                color: _autoReload ? Colors.green : Colors.orange,
-                                                fontWeight: FontWeight.w500,
-                                              ),
-                                            ),
-                                            Text(
-                                              'Next: ${_autoReload ? "2s" : "Manual"}',
-                                              style: const TextStyle(
-                                                fontSize: 14,
-                                                color: Colors.grey,
-                                              ),
-                                            ),
-                                          ],
+                                      Expanded(
+                                        child: _buildModernStatsCard(
+                                          'Temperature',
+                                          latestTemperature?.toStringAsFixed(1) ?? '--',
+                                          '°C',
+                                          Icons.thermostat,
+                                          [Color(0xFFFF6B6B), Color(0xFFFF8E53)],
                                         ),
-                                      ],
-                                      const SizedBox(height: 8),
-                                      Row(
-                                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                        children: [
-                                          const Text(
-                                            'Graph Limit:',
-                                            style: TextStyle(
-                                              fontSize: 14,
-                                              color: Colors.grey,
-                                            ),
-                                          ),
-                                          GestureDetector(
-                                            onTap: _showDataLimitDialog,
-                                            child: Container(
-                                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                                              decoration: BoxDecoration(
-                                                color: Theme.of(context).colorScheme.primary.withOpacity(0.1),
-                                                borderRadius: BorderRadius.circular(12),
-                                                border: Border.all(
-                                                  color: Theme.of(context).colorScheme.primary.withOpacity(0.3),
-                                                ),
-                                              ),
-                                              child: Row(
-                                                mainAxisSize: MainAxisSize.min,
-                                                children: [
-                                                  Text(
-                                                    '$_dataLimit records',
-                                                    style: TextStyle(
-                                                      fontSize: 14,
-                                                      color: Theme.of(context).colorScheme.primary,
-                                                      fontWeight: FontWeight.w500,
-                                                    ),
-                                                  ),
-                                                  const SizedBox(width: 4),
-                                                  Icon(
-                                                    Icons.edit,
-                                                    size: 14,
-                                                    color: Theme.of(context).colorScheme.primary,
-                                                  ),
-                                                ],
-                                              ),
-                                            ),
-                                          ),
-                                        ],
                                       ),
-                                      const SizedBox(height: 8),
-                                      Row(
-                                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                        children: [
-                                          Text(
-                                            'Real-time Updates:',
-                                            style: TextStyle(
-                                              fontSize: 14,
-                                              color: Colors.grey[600],
-                                              fontWeight: FontWeight.w500,
-                                            ),
-                                          ),
-                                          Container(
-                                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                                            decoration: BoxDecoration(
-                                              color: _autoReload ? Colors.green[50] : Colors.orange[50],
-                                              borderRadius: BorderRadius.circular(12),
-                                              border: Border.all(
-                                                color: _autoReload ? Colors.green.withOpacity(0.3) : Colors.orange.withOpacity(0.3),
-                                              ),
-                                            ),
-                                            child: Row(
-                                              mainAxisSize: MainAxisSize.min,
-                                              children: [
-                                                Icon(
-                                                  _autoReload ? Icons.circle : Icons.pause_circle_outline,
-                                                  size: 12,
-                                                  color: _autoReload ? Colors.green[600] : Colors.orange[600],
-                                                ),
-                                                const SizedBox(width: 4),
-                                                Text(
-                                                  _autoReload ? 'LIVE (2s)' : 'PAUSED',
-                                                  style: TextStyle(
-                                                    fontSize: 12,
-                                                    color: _autoReload ? Colors.green[600] : Colors.orange[600],
-                                                    fontWeight: FontWeight.bold,
-                                                  ),
-                                                ),
-                                              ],
-                                            ),
-                                          ),
-                                        ],
+                                      const SizedBox(width: 16),
+                                      Expanded(
+                                        child: _buildModernStatsCard(
+                                          'Humidity',
+                                          latestHumidity?.toStringAsFixed(1) ?? '--',
+                                          '%',
+                                          Icons.water_drop,
+                                          [Color(0xFF4ECDC4), Color(0xFF44A08D)],
+                                        ),
                                       ),
                                     ],
                                   ),
-                                ),
-                              ],
+                                  
+                                  const SizedBox(height: 24),
+                                  
+                                  // Quick Stats Overview
+                                  _buildQuickStatsOverview(),
+                                  
+                                  const SizedBox(height: 24),
+                                  
+                                  // Temperature Chart with Modern Design
+                                  _buildModernChart(
+                                    'Temperature Trend',
+                                    _getTemperatureSpots(),
+                                    [Color(0xFFFF6B6B), Color(0xFFFF8E53)],
+                                    Icons.thermostat,
+                                  ),
+                                  
+                                  // Humidity Chart with Modern Design
+                                  _buildModernChart(
+                                    'Humidity Trend',
+                                    _getHumiditySpots(),
+                                    [Color(0xFF4ECDC4), Color(0xFF44A08D)],
+                                    Icons.water_drop,
+                                  ),
+                                  
+                                  const SizedBox(height: 24),
+                                  
+                                  // Modern Data Info Card
+                                  _buildModernDataInfoCard(),
+                                ],
+                              ),
                             ),
                           ),
-                        ),
-            ),
-          ],
+              ),
+            ],
+          ),
         ),
       ),
     );

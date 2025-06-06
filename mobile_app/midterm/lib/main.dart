@@ -1,8 +1,6 @@
 import 'package:flutter/material.dart';
 import 'dart:async';
 import 'login_page.dart';
-import 'dashboard.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   runApp(const SensorApp());
